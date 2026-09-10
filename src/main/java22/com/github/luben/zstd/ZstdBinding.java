@@ -4,6 +4,7 @@ import com.github.luben.zstd.util.Native;
 
 import org.jetbrains.annotations.NotNull;
 
+import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
 import java.lang.foreign.MemoryLayout;
@@ -13,6 +14,7 @@ import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.lang.invoke.VarHandle;
 
 /**
  * libzstd downcall bindings shared by the FFM implementations.
@@ -179,64 +181,40 @@ final class ZstdBinding {
     }
 
     /**
-     * A {@code size_t*} in/out parameter: a one-element array as wide as the
-     * platform's size_t, because that is how many bytes libzstd writes into it.
-     * The width stays here - callers only ever see {@code long}.
+     * Allocates a {@code size_t*} in/out parameter in {@code arena}, as wide as
+     * the platform's size_t, because that is how many bytes libzstd writes into
+     * it. Read and write it with {@link #getSizeT} and {@link #setSizeT}, which
+     * keep the width out of the call sites.
      */
-    abstract static class SizeTRef {
-
-        /** The array, as a pointer argument. Built once; the array is final. */
-        final @NotNull MemorySegment segment;
-
-        private SizeTRef(@NotNull MemorySegment segment) {
-            this.segment = segment;
-        }
-
-        abstract long get();
-
-        abstract void set(long value);
-
-        private static final class Wide extends SizeTRef {
-            private final long[] cell;
-
-            private Wide(long[] cell) {
-                super(MemorySegment.ofArray(cell));
-                this.cell = cell;
-            }
-
-            long get() {
-                return cell[0];
-            }
-
-            void set(long value) {
-                cell[0] = value;
-            }
-        }
-
-        private static final class Narrow extends SizeTRef {
-            private final int[] cell;
-
-            private Narrow(int[] cell) {
-                super(MemorySegment.ofArray(cell));
-                this.cell = cell;
-            }
-
-            /* size_t is unsigned, so widen it as unsigned - as `adapt` does with
-             * the return values. */
-            long get() {
-                return Integer.toUnsignedLong(cell[0]);
-            }
-
-            void set(long value) {
-                cell[0] = (int) value;
-            }
-        }
+    static @NotNull MemorySegment allocSizeT(@NotNull Arena arena) {
+        return arena.allocate(C_SIZE_T);
     }
 
-    static @NotNull SizeTRef newSizeTRef() {
-        return SIZE_T_IS_64_BIT
-                ? new SizeTRef.Wide(new long[1])
-                : new SizeTRef.Narrow(new int[1]);
+    /* Accesses a slot as a `long` whatever the platform's size_t is, so the width
+     * reaches neither the call sites nor a branch in getSizeT/setSizeT. Where
+     * size_t is 4 bytes the layout's own handle is int-typed, and `filterValue`
+     * wraps it in the same two conversions `adapt` applies to a downcall: narrowing
+     * on the way in, unsigned widening on the way out. Declared below
+     * INT_TO_UNSIGNED_LONG, which it reads while initializing. */
+    private static final VarHandle SIZE_T_HANDLE = sizeTHandle();
+
+    private static VarHandle sizeTHandle() {
+        VarHandle handle = C_SIZE_T.varHandle();
+        if (SIZE_T_IS_64_BIT) {
+            return handle;
+        }
+        /* identity(int) retyped to (long)int - a narrowing cast as a handle. */
+        MethodHandle longToInt = MethodHandles.explicitCastArguments(
+                MethodHandles.identity(int.class), MethodType.methodType(int.class, long.class));
+        return MethodHandles.filterValue(handle, longToInt, INT_TO_UNSIGNED_LONG);
+    }
+
+    static long getSizeT(@NotNull MemorySegment slot) {
+        return (long) SIZE_T_HANDLE.get(slot, 0L);
+    }
+
+    static void setSizeT(@NotNull MemorySegment slot, long value) {
+        SIZE_T_HANDLE.set(slot, 0L, value);
     }
 
     static long cStreamOutSize() {

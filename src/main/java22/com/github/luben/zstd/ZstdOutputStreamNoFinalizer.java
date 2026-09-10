@@ -8,6 +8,7 @@ import org.jetbrains.annotations.Nullable;
 import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 
@@ -42,11 +43,13 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
      * segmentOf below), but `dst` never changes, so it is built once here. */
     private final @NotNull MemorySegment dstSegment;
 
-    /* The two size_t* in/out parameters. Heap arrays rather than off-heap slots:
-     * under Linker.Option.critical a heap segment is a legal pointer argument, so
-     * this stream needs no native memory and therefore no Arena at all. */
-    private final @NotNull ZstdBinding.SizeTRef dstPos = ZstdBinding.newSizeTRef();
-    private final @NotNull ZstdBinding.SizeTRef srcPos = ZstdBinding.newSizeTRef();
+    /* The two size_t* in/out parameters: libzstd writes back through them how much
+     * it produced and how far it got through the input. C passes `&dstPos`, and
+     * Java cannot take the address of a field, so the value needs a slot of its
+     * own - here off-heap, which makes the Arena this stream's to close. */
+    private final @NotNull Arena arena = Arena.ofConfined();
+    private final @NotNull MemorySegment dstPos = ZstdBinding.allocSizeT(arena);
+    private final @NotNull MemorySegment srcPos = ZstdBinding.allocSizeT(arena);
 
     /* MemorySegment.ofArray allocates, and write() is called once per chunk - at
      * a 1-byte chunk size that is one wrapper per byte. Streams are almost always
@@ -66,12 +69,12 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
      * on every call in the JNI build. On return dstPos is how many bytes libzstd
      * produced and srcPos how far it got through the input. */
     private long compressStream2(@NotNull MemorySegment src, long srcSize, long srcPosition, int endOp) {
-        dstPos.set(0);
-        srcPos.set(srcPosition);
+        ZstdBinding.setSizeT(dstPos, 0L);
+        ZstdBinding.setSizeT(srcPos, srcPosition);
         return ZstdBinding.compressStream2(
                 cstream,
-                dstSegment, dstSize, dstPos.segment,
-                src, srcSize, srcPos.segment,
+                dstSegment, dstSize, dstPos,
+                src, srcSize, srcPos,
                 endOp);
     }
 
@@ -472,8 +475,8 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
             if (Zstd.isError(size)) {
                 throw new ZstdIOException(size);
             }
-            srcPosition = srcPos.get();
-            long dstPosition = dstPos.get();
+            srcPosition = ZstdBinding.getSizeT(srcPos);
+            long dstPosition = ZstdBinding.getSizeT(dstPos);
             if (dstPosition > 0) {
                 out.write(dst, 0, (int) dstPosition);
             }
@@ -502,7 +505,7 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
                     if (Zstd.isError(size)) {
                         throw new ZstdIOException(size);
                     }
-                    out.write(dst, 0, (int) dstPos.get());
+                    out.write(dst, 0, (int) ZstdBinding.getSizeT(dstPos));
                 } while (size > 0);
                 frameClosed = true;
             } else {
@@ -513,7 +516,7 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
                     if (Zstd.isError(size)) {
                         throw new ZstdIOException(size);
                     }
-                    out.write(dst, 0, (int) dstPos.get());
+                    out.write(dst, 0, (int) ZstdBinding.getSizeT(dstPos));
                 } while (size > 0);
             }
             out.flush();
@@ -553,7 +556,7 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
                     if (Zstd.isError(size)) {
                         throw new ZstdIOException(size);
                     }
-                    out.write(dst, 0, (int) dstPos.get());
+                    out.write(dst, 0, (int) ZstdBinding.getSizeT(dstPos));
                 } while (size > 0);
             }
             if (closeParentStream) {
@@ -568,6 +571,8 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
             isClosed = true;
             bufferPool.release(dstByteBuffer);
             ZstdBinding.freeCStream(cstream);
+            // after the last downcall: it frees the two size_t slots
+            arena.close();
             // do not keep the caller's last source array alive past close()
             lastSrcArray = null;
             lastSrcSegment = null;
