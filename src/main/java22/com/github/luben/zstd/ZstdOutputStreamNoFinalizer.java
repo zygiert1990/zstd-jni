@@ -47,7 +47,7 @@ public class ZstdOutputStreamNoFinalizer extends FilterOutputStream {
      * it produced and how far it got through the input. C passes `&dstPos`, and
      * Java cannot take the address of a field, so the value needs a slot of its
      * own - here off-heap, which makes the Arena this stream's to close. */
-    private final @NotNull Arena arena = Arena.ofConfined();
+    private final @NotNull Arena arena = Arena.ofShared();
     private final @NotNull MemorySegment dstPos = ZstdBinding.allocSizeT(arena);
     private final @NotNull MemorySegment srcPos = ZstdBinding.allocSizeT(arena);
 
