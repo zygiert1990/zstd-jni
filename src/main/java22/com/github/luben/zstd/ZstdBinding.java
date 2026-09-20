@@ -6,12 +6,10 @@ import org.jetbrains.annotations.NotNull;
 
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
-import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 
 /**
@@ -34,28 +32,9 @@ final class ZstdBinding {
 
     private static final SymbolLookup LOOKUP = SymbolLookup.loaderLookup();
 
-    /* libzstd deals in size_t, which FFM has no layout for - the linker knows the
-     * platform's. Every specialized ABI linker is 64-bit, but a platform without
-     * one falls back to the libffi FallbackLinker, whose size_t is the platform's:
-     * 4 bytes on a 32-bit JDK (Debian ships such builds for i386 and armhf). Java
-     * has no 32-bit-wide `long`, so the signatures below stay 64-bit and the width
-     * difference is absorbed in `adapt` instead. */
-    private static final ValueLayout C_SIZE_T = cSizeT();
-
-    private static final boolean SIZE_T_IS_64_BIT = C_SIZE_T.byteSize() == 8;
-
-    /* Declared ahead of every downcall handle below: `adapt` reads it while they
-     * initialize, and static initializers run in source order. */
-    private static final MethodHandle INT_TO_UNSIGNED_LONG = intToUnsignedLong();
-
-    private static MethodHandle intToUnsignedLong() {
-        try {
-            return MethodHandles.lookup().findStatic(
-                    Integer.class, "toUnsignedLong", MethodType.methodType(long.class, int.class));
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError("Integer.toUnsignedLong is missing", e);
-        }
-    }
+    /* This binding assumes a 64-bit size_t. */
+    private static final ValueLayout.OfLong C_SIZE_T =
+            (ValueLayout.OfLong) LINKER.canonicalLayouts().get("size_t");
 
     private static Linker nativeLinker() {
         try {
@@ -72,41 +51,6 @@ final class ZstdBinding {
                             + " have. Start the JVM with -Djdk.util.jar.enableMultiRelease=false to use"
                             + " the JNI implementation instead.", e);
         }
-    }
-
-    private static ValueLayout cSizeT() {
-        MemoryLayout sizeT = LINKER.canonicalLayouts().get("size_t");
-        if (sizeT instanceof ValueLayout.OfLong || sizeT instanceof ValueLayout.OfInt) {
-            return (ValueLayout) sizeT;
-        }
-        throw new UnsupportedOperationException("Unexpected size_t layout " + sizeT);
-    }
-
-    /**
-     * Makes a downcall handle match {@code javaType}, which types every size_t as
-     * {@code long}. A no-op where size_t is 64-bit. Where it is 32-bit the handle
-     * really takes and returns {@code int}, and two steps, in this order, fix that:
-     * <ol>
-     * <li><b>The return value</b> is widened by {@code filterReturnValue}, using
-     *     {@code Integer.toUnsignedLong}. Unsigned because that is what the JNI
-     *     build's {@code (jlong) size_t} produces, so {@code Zstd.isError} sees the
-     *     same value in both builds. This has to happen first, because - despite
-     *     the name - {@code explicitCastArguments} converts the return value as
-     *     well, and it would use the plain {@code (long) anInt} widening, which
-     *     sign-extends.</li>
-     * <li><b>The arguments</b> are narrowed to {@code int} by
-     *     {@code explicitCastArguments}, which by then finds the return type
-     *     already right and leaves it alone. Narrowing is safe here because every
-     *     size_t argument is a length or an offset. It is also why the call is not
-     *     {@code asType}, which refuses a narrowing primitive cast.</li>
-     * </ol>
-     */
-    private static MethodHandle adapt(@NotNull MethodHandle handle, @NotNull MethodType javaType) {
-        MethodHandle adapted = handle;
-        if (adapted.type().returnType() == int.class && javaType.returnType() == long.class) {
-            adapted = MethodHandles.filterReturnValue(adapted, INT_TO_UNSIGNED_LONG);
-        }
-        return MethodHandles.explicitCastArguments(adapted, javaType);
     }
 
     /* ZSTD_EndDirective */
@@ -203,13 +147,13 @@ final class ZstdBinding {
     private static MethodHandle downcall(@NotNull String name,
                                          @NotNull FunctionDescriptor descriptor,
                                          @NotNull MethodType javaType) {
-        return adapt(LINKER.downcallHandle(symbol(name), descriptor), javaType);
+        return LINKER.downcallHandle(symbol(name), descriptor).asType(javaType);
     }
 
     private static MethodHandle downcallCritical(@NotNull String name,
                                                  @NotNull FunctionDescriptor descriptor,
                                                  @NotNull MethodType javaType) {
-        return adapt(LINKER.downcallHandle(symbol(name), descriptor, Linker.Option.critical(true)), javaType);
+        return LINKER.downcallHandle(symbol(name), descriptor, Linker.Option.critical(true)).asType(javaType);
     }
 
     private static @NotNull MemorySegment symbol(@NotNull String name) {
@@ -218,9 +162,8 @@ final class ZstdBinding {
     }
 
     /**
-     * A {@code size_t*} in/out parameter: a one-element array as wide as the
-     * platform's size_t, because that is how many bytes libzstd writes into it.
-     * The width stays here - callers only ever see {@code long}.
+     * A {@code size_t*} in/out parameter backed by a one-element {@code long}
+     * array, matching this binding's assumption that size_t is 64-bit.
      */
     abstract static class SizeTRef {
 
@@ -252,30 +195,10 @@ final class ZstdBinding {
             }
         }
 
-        private static final class Narrow extends SizeTRef {
-            private final int[] cell;
-
-            private Narrow(int[] cell) {
-                super(MemorySegment.ofArray(cell));
-                this.cell = cell;
-            }
-
-            /* size_t is unsigned, so widen it as unsigned - as `adapt` does with
-             * the return values. */
-            long get() {
-                return Integer.toUnsignedLong(cell[0]);
-            }
-
-            void set(long value) {
-                cell[0] = (int) value;
-            }
-        }
     }
 
     static @NotNull SizeTRef newSizeTRef() {
-        return SIZE_T_IS_64_BIT
-                ? new SizeTRef.Wide(new long[1])
-                : new SizeTRef.Narrow(new int[1]);
+        return new SizeTRef.Wide(new long[1]);
     }
 
     static long cStreamOutSize() {
