@@ -5,7 +5,7 @@ inputs:
     description: 'docker --platform of the guest'
     required: true
   image:
-    description: 'guest image; needs a JDK 22+ on PATH or apt-installable openjdk-25'
+    description: 'guest image; its architecture-specific script supplies or configures JDK 25'
     required: true
   build-script:
     description: 'architecture-specific build script from this action directory'
