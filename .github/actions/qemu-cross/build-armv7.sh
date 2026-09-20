@@ -17,10 +17,13 @@ readonly JDK_SOURCE_DIR="${FALLBACK_WORK_DIR}/jdk-source"
 readonly FALLBACK_BUILD_DIR="${FALLBACK_WORK_DIR}/build"
 
 apt-get update
+# libc6-dev is only a Recommends of gcc, so --no-install-recommends would
+# otherwise leave the compiler without stdio.h and friends.
 apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     gcc \
+    libc6-dev \
     libffi-dev \
     pkg-config
 
